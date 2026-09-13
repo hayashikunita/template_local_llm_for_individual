@@ -56,6 +56,10 @@ class Store:
             result["messages"] = [dict(message) for message in database.execute(
                 "SELECT * FROM messages WHERE conversation_id=? ORDER BY id", (identity,)
             )]
+            for message in result["messages"]:
+                settings = json.loads(message["settings"])
+                message["references"] = settings.get("references", []) if message["role"] == "assistant" else []
+                message["rag"] = settings.get("rag", False)
             return result
 
     def rename(self, identity: str, title: str) -> None:

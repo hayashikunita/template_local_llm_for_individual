@@ -4,13 +4,44 @@ import type { ChildProcess } from "node:child_process";
 import { mkdtempSync, rmSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { createServer } from "node:http";
+import type { Server } from "node:http";
+import type { AddressInfo } from "node:net";
 
 let server: ChildProcess;
+let inferenceServer: Server;
+let inferenceRequests = 0;
 let directory: string;
 let launchURL: string;
 const root = path.resolve("..");
 
 test.beforeAll(async () => {
+  inferenceServer = createServer((incoming, outgoing) => {
+    if (incoming.url === "/api/tags") {
+      outgoing.setHeader("Content-Type", "application/json");
+      outgoing.end(JSON.stringify({ models: [{ name: "test-rag" }] }));
+      return;
+    }
+    if (incoming.url !== "/api/chat") {
+      outgoing.writeHead(404).end();
+      return;
+    }
+    let body = "";
+    incoming.on("data", (chunk) => { body += chunk.toString(); });
+    incoming.on("end", () => {
+      inferenceRequests++;
+      const payload = JSON.parse(body);
+      const prompt = payload.messages[0];
+      if (prompt.role !== "system" || !prompt.content.includes("8000") || !prompt.content.includes("untrusted data")) {
+        outgoing.writeHead(400).end();
+        return;
+      }
+      outgoing.setHeader("Content-Type", "application/x-ndjson");
+      outgoing.end(JSON.stringify({ message: { content: "交通費の上限は月額8000円です。[1]" }, done: true }) + "\n");
+    });
+  });
+  await new Promise<void>((resolve) => inferenceServer.listen(0, "127.0.0.1", resolve));
+  const inferencePort = (inferenceServer.address() as AddressInfo).port;
   directory = mkdtempSync(path.join(tmpdir(), "local-llm-e2e-"));
   const python = path.join(
     root,
@@ -26,6 +57,7 @@ test.beforeAll(async () => {
         ...process.env,
         LOCAL_LLM_DATA_DIR: directory,
         PYTHONIOENCODING: "utf-8",
+        OLLAMA_URL: `http://127.0.0.1:${inferencePort}`,
       },
       stdio: ["ignore", "pipe", "pipe"],
     },
@@ -60,6 +92,7 @@ test.afterAll(async () => {
       server.kill();
     });
   }
+  if (inferenceServer) await new Promise<void>((resolve, reject) => inferenceServer.close((error) => error ? reject(error) : resolve()));
   if (directory)
     rmSync(directory, {
       recursive: true,
@@ -174,6 +207,54 @@ test("chat, cancellation, persistence, API boundaries and responsive layout", as
     path: "test-results/screenshots/desktop-api.png",
     fullPage: true,
   });
+
+  await page.getByRole("button", { name: "ナレッジ", exact: true }).click();
+  const original = Buffer.from("# 架空の規程\n交通費の上限は月額8000円です。\n<img src=\"https://example.invalid/collect\">", "utf8");
+  await page.getByLabel("文書ファイル", { exact: true }).setInputFiles({ name: "架空規程.md", mimeType: "text/markdown", buffer: original });
+  await expect(page.getByLabel("架空規程.mdを検索対象にする")).toBeChecked();
+  await page.getByRole("textbox", { name: "文書の検索語句" }).fill("交通費");
+  await page.getByRole("button", { name: "文書を検索", exact: true }).click();
+  await expect(page.getByRole("status")).toHaveText("検索結果 1 件");
+  await page.locator(".references summary").click();
+  await expect(page.locator(".reference-excerpt")).toContainText("8000");
+  await expect(page.locator(".references img")).toHaveCount(0);
+  const originalPath = await page.getByRole("link", { name: "架空規程.mdの原本", exact: true }).getAttribute("href");
+  expect(await (await page.request.get(origin + originalPath)).body()).toEqual(original);
+  await page.screenshot({ path: "test-results/screenshots/desktop-knowledge.png", fullPage: true });
+  await page.getByRole("button", { name: "選択文書で新しい会話" }).click();
+  await expect(page.getByRole("combobox", { name: "モデル", exact: true })).toHaveValue("test-rag");
+  await expect(page.getByLabel("文書検索を有効にする")).toBeChecked();
+  await page.getByRole("textbox", { name: "メッセージ", exact: true }).fill("交通費の上限は？");
+  await page.getByRole("button", { name: "送信", exact: true }).click();
+  await expect(page.locator(".message.assistant .message-text")).toContainText("8000円です。[1]");
+  await expect(page.locator(".message.assistant .message-meta")).toContainText("完了");
+  await page.locator(".references summary").click();
+  await expect(page.locator(".reference-excerpt")).toContainText("交通費の上限");
+  await page.screenshot({ path: "test-results/screenshots/desktop-rag.png", fullPage: true });
+  expect(inferenceRequests).toBe(1);
+  await page.reload();
+  await page.getByRole("button", { name: "交通費の上限は？", exact: true }).click();
+  await expect(page.locator(".references summary")).toContainText("架空規程.md / 行 1–3");
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.locator(".references summary").click();
+  await expect(page.getByLabel("文書検索を有効にする")).toBeInViewport();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  await page.screenshot({ path: "test-results/screenshots/mobile-rag.png", fullPage: true });
+  await page.getByRole("button", { name: "検索対象の文書を選ぶ" }).click();
+  await page.getByLabel("架空規程.mdを検索対象にする").check();
+  await page.screenshot({ path: "test-results/screenshots/mobile-knowledge.png", fullPage: true });
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  await page.getByRole("button", { name: "選択文書で新しい会話" }).click();
+  await page.getByRole("textbox", { name: "メッセージ", exact: true }).fill("宇宙旅行について");
+  await page.getByRole("button", { name: "送信", exact: true }).click();
+  await expect(page.locator(".message.assistant .message-text")).toContainText("一致する情報が見つかりません");
+  expect(inferenceRequests).toBe(1);
+  await page.getByRole("button", { name: "検索対象の文書を選ぶ" }).click();
+  page.once("dialog", (dialog) => void dialog.accept());
+  await page.getByRole("button", { name: "架空規程.mdを削除", exact: true }).click();
+  await expect(page.getByText("登録済み文書はありません", { exact: true })).toBeVisible();
+  expect((await page.request.get(origin + originalPath)).status()).toBe(404);
+  await page.setViewportSize({ width: 1440, height: 960 });
 
   await page.getByRole("button", { name: "チャット", exact: true }).click();
   await page.setViewportSize({ width: 390, height: 844 });

@@ -19,6 +19,7 @@ from starlette.staticfiles import StaticFiles
 
 from backend.config import Settings
 from backend.inference import DEMO_MODEL, Inference
+from backend.knowledge import Knowledge, MAX_DOCUMENT_BYTES
 from backend.storage import Store
 
 LOGGER = logging.getLogger("local_llm")
@@ -60,6 +61,12 @@ class UIMessage(StrictModel):
     model: str = Field(default=DEMO_MODEL, max_length=200)
     temperature: float = Field(default=0.7, ge=0, le=2)
     max_tokens: int = Field(default=512, ge=16, le=2048)
+    document_ids: list[str] = Field(default_factory=list, max_length=20)
+
+
+class DocumentSearch(StrictModel):
+    query: str = Field(min_length=2, max_length=500)
+    document_ids: list[str] = Field(min_length=1, max_length=20)
 
 
 @dataclass
@@ -72,6 +79,8 @@ class Job:
     output: str = ""
     status: str = "generating"
     error: str | None = None
+    references: list[dict] = field(default_factory=list)
+    rag: bool = False
     queue: asyncio.Queue = field(default_factory=lambda: asyncio.Queue(maxsize=128))
 
 
@@ -81,6 +90,7 @@ def digest(value: str) -> str:
 
 def create_app(settings: Settings, inference: Inference | None = None) -> FastAPI:
     store = Store(settings.data_dir)
+    knowledge = Knowledge(settings.data_dir)
     engine = inference or Inference(settings.ollama_url)
     jobs: dict[str, Job] = {}
     sessions: dict[str, float] = {}
@@ -210,6 +220,49 @@ def create_app(settings: Settings, inference: Inference | None = None) -> FastAP
     async def conversations(_owner=Depends(ui_auth)):
         return store.listing()
 
+    def checked_documents(identities: list[str]):
+        available = {document["id"] for document in knowledge.listing()}
+        if any(identity not in available for identity in identities):
+            raise HTTPException(404, "選択した文書が見つかりません。文書一覧を更新してください。")
+
+    @app.get("/ui/documents")
+    async def documents(_owner=Depends(ui_auth)):
+        return knowledge.listing()
+
+    @app.post("/ui/documents", status_code=201)
+    async def register_document(request: Request, name: str, _owner=Depends(ui_auth)):
+        original = bytearray()
+        async for part in request.stream():
+            original.extend(part)
+            if len(original) > MAX_DOCUMENT_BYTES:
+                raise HTTPException(413, "文書は80,000バイト以下にしてください。")
+        try:
+            return knowledge.register(name, bytes(original))
+        except ValueError as exception:
+            raise HTTPException(422, str(exception)) from exception
+
+    @app.post("/ui/documents/search")
+    async def search_documents(body: DocumentSearch, _owner=Depends(ui_auth)):
+        checked_documents(body.document_ids)
+        return {"references": knowledge.search(body.query, body.document_ids)}
+
+    @app.get("/ui/documents/{identity}/original")
+    async def original_document(identity: str, _owner=Depends(ui_auth)):
+        original = knowledge.original(identity)
+        if original is None:
+            raise HTTPException(404, "原本が見つかりません。削除済みの可能性があります。")
+        return Response(original, media_type="application/octet-stream", headers={
+            "Content-Disposition": f'attachment; filename="document-{identity}.txt"',
+        })
+
+    @app.delete("/ui/documents/{identity}")
+    async def delete_document(identity: str, _owner=Depends(ui_auth)):
+        if any(job.status == "generating" for job in jobs.values()):
+            raise HTTPException(409, "生成を停止してから文書を削除してください。")
+        if not knowledge.delete(identity):
+            raise HTTPException(404, "文書が見つかりません。")
+        return {"deleted": True}
+
     @app.post("/ui/conversations", status_code=201)
     async def create_conversation(body: Title, _owner=Depends(ui_auth)):
         return store.create(body.title.strip() or "新しい会話")
@@ -240,9 +293,20 @@ def create_app(settings: Settings, inference: Inference | None = None) -> FastAP
         message_id = None
         try:
             if job.conversation_id:
-                message_id = store.begin(job.conversation_id, body.messages[-1].content, body.model, job.identity, {"temperature": body.temperature, "max_tokens": body.max_tokens, "prompt_version": "1"})
+                message_id = store.begin(job.conversation_id, body.messages[-1].content, body.model, job.identity, {
+                    "temperature": body.temperature, "max_tokens": body.max_tokens,
+                    "prompt_version": "rag-1" if job.rag else "1", "rag": job.rag,
+                    "references": job.references,
+                })
+            if job.rag and not job.references:
+                job.output = "選択した文書に一致する情報が見つかりません。文書中の具体的な語句を含めて質問してください。"
+                job.status = "complete"
+                if body.stream:
+                    await job.queue.put(job.output)
+                return
+            options = {"references": job.references} if job.rag else {}
             async with asyncio.timeout(120):
-                async for token in engine.generate(body.model, [item.model_dump() for item in body.messages], body.temperature, body.max_tokens):
+                async for token in engine.generate(body.model, [item.model_dump() for item in body.messages], body.temperature, body.max_tokens, **options):
                     if job.owner.startswith("api:") and api_tokens.get(job.owner[4:], 0) <= time.monotonic():
                         raise asyncio.CancelledError
                     if len(job.output) + len(token) > 50000:
@@ -267,7 +331,7 @@ def create_app(settings: Settings, inference: Inference | None = None) -> FastAP
     def event(name: str, data: dict) -> str:
         return f"event: {name}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
-    async def generate_response(body: Generate, owner: str, request: Request, conversation_id: str | None = None):
+    async def generate_response(body: Generate, owner: str, request: Request, conversation_id: str | None = None, document_ids: list[str] | None = None):
         if any(job.status == "generating" for job in jobs.values()):
             raise HTTPException(429, "別の回答を生成中です。完了後に再試行してください。")
         available = await engine.models()
@@ -275,15 +339,28 @@ def create_app(settings: Settings, inference: Inference | None = None) -> FastAP
             raise HTTPException(503, "指定したモデルは利用できません。モデル一覧を更新してください。")
         if any(job.status == "generating" for job in jobs.values()):
             raise HTTPException(429, "別の回答を生成中です。")
+        references = []
+        if document_ids:
+            checked_documents(document_ids)
+            if body.model == DEMO_MODEL:
+                raise HTTPException(422, "文書検索で回答するには、接続テストではなくOllamaのモデルを選んでください。")
+            if len(body.messages[-1].content) > 500:
+                raise HTTPException(413, "文書検索の質問は500文字以下にしてください。")
+            if sum(len(item.content) for item in body.messages) > 2000:
+                raise HTTPException(413, "文書検索の会話は合計2,000文字までです。新しい会話で短く質問してください。")
+            references = knowledge.search(body.messages[-1].content, document_ids)[:2]
         for old_id in [identity for identity, job in jobs.items() if job.status != "generating"]:
             del jobs[old_id]
         job = Job(request.state.identity, owner, conversation_id, body.model)
+        job.references = references
+        job.rag = bool(document_ids)
         jobs[job.identity] = job
         job.task = asyncio.create_task(run_job(job, body))
 
         def result():
-            return {"request_id": job.identity, "model": job.model, "prompt_version": "1", "status": job.status,
-                    "content": job.output, "error": job.error, "references": [], "demo": job.model == DEMO_MODEL}
+                return {"request_id": job.identity, "model": job.model, "prompt_version": "rag-1" if job.rag else "1", "status": job.status,
+                    "content": job.output, "error": job.error, "references": job.references,
+                    "rag": job.rag, "demo": job.model == DEMO_MODEL}
 
         async def chunks():
             try:
@@ -327,7 +404,7 @@ def create_app(settings: Settings, inference: Inference | None = None) -> FastAP
         if len(messages) > 40 or sum(len(item["content"]) for item in messages) > 24000:
             raise HTTPException(413, "会話が長すぎます。新しい会話を作成してください。")
         payload = Generate(messages=messages, model=body.model, temperature=body.temperature, max_tokens=body.max_tokens)
-        return await generate_response(payload, owner, request, identity)
+        return await generate_response(payload, owner, request, identity, body.document_ids)
 
     async def cancel(identity: str, owner: str):
         job = jobs.get(identity)

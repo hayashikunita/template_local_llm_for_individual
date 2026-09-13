@@ -1,6 +1,8 @@
 import asyncio
 import json
+import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -143,6 +145,110 @@ class APITests(unittest.TestCase):
         self.assertEqual([message["status"] for message in messages], ["complete", "interrupted"])
         self.assertEqual(messages[0]["content"], "unfinished")
         self.assertEqual(messages[1]["content"], "")
+
+
+class RAGInference(Inference):
+    def __init__(self, endpoint):
+        super().__init__(endpoint)
+        self.references = None
+        self.calls = 0
+
+    async def models(self):
+        return {"models": [{"id": "test-rag", "provider": "ollama"}, {"id": DEMO_MODEL, "provider": "demo"}]}
+
+    async def generate(self, model, messages, temperature, max_tokens, *, references=None):
+        self.calls += 1
+        self.references = references
+        yield "交通費は月額8000円です。[1]"
+
+
+class KnowledgeAPITests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.settings = Settings(Path(self.temporary.name))
+        self.engine = RAGInference(self.settings.ollama_url)
+        self.app = create_app(self.settings, self.engine)
+        self.client = TestClient(self.app, base_url="http://127.0.0.1:8765")
+        self.client.headers["Origin"] = "http://127.0.0.1:8765"
+
+    def tearDown(self):
+        self.client.close()
+        self.temporary.cleanup()
+
+    def login(self):
+        self.client.post("/auth/session", json={"code": self.app.state.launch_code})
+
+    @unittest.skipUnless(os.environ.get("LOCAL_LLM_LIVE_TEST") == "1", "Explicit opt-in required for real Ollama inference")
+    def test_live_ollama_rag(self):
+        self.client.close()
+        self.app = create_app(self.settings)
+        self.client = TestClient(self.app, base_url="http://127.0.0.1:8765")
+        self.client.headers["Origin"] = "http://127.0.0.1:8765"
+        self.login()
+        model = "qwen3:4b-instruct-2507-q4_K_M"
+        self.assertIn(model, [item["id"] for item in self.client.get("/ui/models").json()["models"]])
+        original = "# 架空の受付規程\nミナト試験計画の受付コードはZX-4827です。受付締切は毎月23日です。".encode()
+        document = self.client.post("/ui/documents", params={"name": "架空受付.md"}, content=original).json()
+        identity = self.client.post("/ui/conversations", json={"title": "実モデルRAG検証"}).json()["id"]
+        started = time.monotonic()
+        response = self.client.post(f"/ui/conversations/{identity}/chat", json={
+            "content": "ミナト試験計画の受付コードと受付締切を、出典番号付きで短く答えてください。",
+            "model": model, "document_ids": [document["id"]], "temperature": 0, "max_tokens": 256,
+        })
+        self.assertEqual(response.status_code, 200)
+        saved = self.client.get(f"/ui/conversations/{identity}").json()["messages"][-1]
+        self.assertEqual(saved["status"], "complete")
+        self.assertIn("ZX-4827", saved["content"])
+        self.assertIn("23", saved["content"])
+        self.assertIn("[1]", saved["content"])
+        self.assertEqual(saved["references"][0]["sha256"], document["sha256"])
+        print(json.dumps({"model": model, "seconds": round(time.monotonic() - started, 1),
+                          "answer": saved["content"], "references": len(saved["references"])}, ensure_ascii=False))
+
+    def test_documents_rag_persistence_and_deletion(self):
+        self.assertEqual(self.client.get("/ui/documents").status_code, 401)
+        self.login()
+        original = "# 架空の規程\n交通費の上限は月額8000円です。".encode()
+        uploaded = self.client.post("/ui/documents", params={"name": "規程.md"}, content=original)
+        self.assertEqual(uploaded.status_code, 201)
+        document = uploaded.json()
+        identity = self.client.post("/ui/conversations", json={"title": "RAG"}).json()["id"]
+        body = {"content": "交通費の上限は？", "model": "test-rag", "document_ids": [document["id"]]}
+        response = self.client.post(f"/ui/conversations/{identity}/chat", json=body)
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('"status": "complete"', response.text)
+        self.assertEqual(self.engine.references[0]["sha256"], document["sha256"])
+        saved = self.client.get(f"/ui/conversations/{identity}").json()["messages"][-1]
+        self.assertEqual(saved["references"][0]["name"], "規程.md")
+        self.assertTrue(saved["rag"])
+        restarted = create_app(self.settings).state.store.get(identity)
+        self.assertEqual(restarted["messages"][-1]["references"], saved["references"])
+        self.assertEqual(self.client.get(f'/ui/documents/{document["id"]}/original').content, original)
+        self.assertEqual(self.client.delete(f'/ui/documents/{document["id"]}').status_code, 200)
+        self.assertEqual(self.client.post(f"/ui/conversations/{identity}/chat", json=body).status_code, 404)
+        self.assertEqual(self.client.get(f'/ui/documents/{document["id"]}/original').status_code, 404)
+
+    def test_no_matches_boundaries_and_api_isolation(self):
+        self.login()
+        document = self.client.post("/ui/documents", params={"name": "sample.txt"}, content="交通費8000円".encode()).json()
+        identity = self.client.post("/ui/conversations", json={}).json()["id"]
+        body = {"content": "宇宙旅行について", "model": "test-rag", "document_ids": [document["id"]]}
+        response = self.client.post(f"/ui/conversations/{identity}/chat", json=body)
+        self.assertIn("一致する情報が見つかりません", response.text)
+        self.assertEqual(self.engine.calls, 0)
+        for override, status in [({"model": DEMO_MODEL}, 422), ({"document_ids": ["missing"]}, 404), ({"content": "長" * 501}, 413)]:
+            self.assertEqual(self.client.post(f"/ui/conversations/{identity}/chat", json={**body, **override}).status_code, status)
+        result = self.client.post("/ui/documents/search", json={"query": "交通費", "document_ids": [document["id"]]})
+        self.assertEqual(result.json()["references"][0]["document_id"], document["id"])
+        self.assertEqual(self.client.post("/ui/documents", params={"name": "file.pdf"}, content=b"%PDF").status_code, 422)
+        self.assertEqual(self.client.post("/ui/documents", params={"name": "file.txt"}, content=b"a" * 80001).status_code, 413)
+        self.assertEqual(self.client.post("/ui/documents", params={"name": "file.txt"}, content=b"data", headers={"Origin": "https://evil.example"}).status_code, 403)
+        token = self.client.post("/ui/api-token").json()["token"]
+        headers = {"Authorization": f"Bearer {token}"}
+        self.assertEqual(self.client.post("/api/v1/chat", headers=headers, json={"messages": [{"role": "user", "content": "test"}], "document_ids": [document["id"]]}).status_code, 422)
+        self.client.cookies.clear()
+        self.assertEqual(self.client.get("/ui/documents", headers=headers).status_code, 401)
+        self.assertEqual(self.client.get(f'/ui/documents/{document["id"]}/original', headers=headers).status_code, 401)
 
 
 class ControlledInference(DemoInference):

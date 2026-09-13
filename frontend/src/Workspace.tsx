@@ -25,7 +25,8 @@ import {
   FlaskConical,
 } from "lucide-react";
 import { initialize, request, streamChat } from "./api";
-import type { ChatMessage, Conversation, Model, Status } from "./api";
+import type { ChatMessage, Conversation, Model, Status, KnowledgeDocument } from "./api";
+import KnowledgePanel, { References } from "./Knowledge";
 
 const demo = "demo-preview";
 const statusLabels: Record<string, string> = {
@@ -58,7 +59,10 @@ export default function Workspace() {
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [switching, setSwitching] = useState(false);
-  const [view, setView] = useState<"chat" | "api">("chat");
+  const [view, setView] = useState<"chat" | "api" | "knowledge">("chat");
+  const [documents, setDocuments] = useState<KnowledgeDocument[]>([]);
+  const [selectedDocuments, setSelectedDocuments] = useState<string[]>([]);
+  const [ragEnabled, setRagEnabled] = useState(false);
   const [sidebar, setSidebar] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [temperature, setTemperature] = useState(0.7);
@@ -87,15 +91,17 @@ export default function Workspace() {
     let cancelled = false;
     void initialize()
       .then(async (result) => {
-        const [items, catalog] = await Promise.all([
+        const [items, catalog, knowledge] = await Promise.all([
           request<Conversation[]>("/ui/conversations"),
           request<{ models: Model[]; ollama: string }>("/ui/models"),
+          request<KnowledgeDocument[]>("/ui/documents"),
         ]);
         if (cancelled) return;
         setStatus(result);
         setConversations(items);
         setModels(catalog.models);
         setOllama(catalog.ollama);
+        setDocuments(knowledge);
         setAuthenticated(true);
       })
       .catch((reason) => {
@@ -125,6 +131,7 @@ export default function Workspace() {
       const item = await request<Conversation>(`/ui/conversations/${identity}`);
       setActive(identity);
       setMessages(item.messages ?? []);
+      setRagEnabled(false);
       setView("chat");
       setSidebar(false);
     } catch (reason) {
@@ -138,6 +145,7 @@ export default function Workspace() {
     if (busy || switching) return;
     setActive(null);
     setMessages([]);
+    setRagEnabled(false);
     setInput("");
     setError("");
     setView("chat");
@@ -184,7 +192,7 @@ export default function Workspace() {
       ]);
       await streamChat(
         `/ui/conversations/${identity}/chat`,
-        { content, model, temperature, max_tokens: maxTokens },
+        { content, model, temperature, max_tokens: maxTokens, document_ids: ragEnabled ? selectedDocuments : [] },
         controller.signal,
         (name, data) => {
           if (name === "start") requestId.current = data.request_id ?? null;
@@ -204,6 +212,8 @@ export default function Workspace() {
                       ...item,
                       content: data.content ?? item.content,
                       status: data.status ?? "complete",
+                      references: data.references,
+                      rag: data.rag,
                     }
                   : item,
               ),
@@ -351,6 +361,10 @@ export default function Workspace() {
               className={`tiny-dot ${status.api_enabled ? "online" : ""}`}
             />
           </button>
+          <button className={view === "knowledge" ? "nav-item selected" : "nav-item"}
+            onClick={() => { setView("knowledge"); setSidebar(false); }}>
+            <FileText size={17} />ナレッジ
+          </button>
         </nav>
         <div className="history-heading">
           <span>会話履歴</span>
@@ -392,7 +406,7 @@ export default function Workspace() {
           <ShieldCheck size={18} />
           <div>
             <strong>端末内のワークスペース</strong>
-            <span>検証専用 · RAG未対応</span>
+            <span>検証専用 · 公開・架空データのみ</span>
           </div>
         </div>
         <div className="sidebar-footer">
@@ -416,7 +430,7 @@ export default function Workspace() {
           <div className="breadcrumb">
             <span>ワークスペース</span>
             <ChevronRight size={13} />
-            <strong>{view === "api" ? "API連携" : "チャット"}</strong>
+            <strong>{view === "api" ? "API連携" : view === "knowledge" ? "ナレッジ" : "チャット"}</strong>
           </div>
           <span className="prototype-badge">
             <FlaskConical size={13} />
@@ -505,7 +519,22 @@ export default function Workspace() {
               </section>
             )}
 
-            {view === "api" ? (
+            {view === "knowledge" ? (
+              <KnowledgePanel documents={documents} selected={selectedDocuments} busy={busy || switching}
+                setDocuments={setDocuments} setSelected={(identities) => {
+                  setSelectedDocuments(identities);
+                  if (!identities.length) setRagEnabled(false);
+                }} onError={setError}
+                onChat={() => {
+                  newConversation();
+                  setRagEnabled(true);
+                  const available = models.find((item) => item.provider === "ollama");
+                  if (model === demo && available) {
+                    setModel(available.id);
+                    localStorage.setItem("local-llm-model", available.id);
+                  }
+                }} />
+            ) : view === "api" ? (
               <div className="api-view">
                 <div className="section-heading">
                   <div>
@@ -693,10 +722,12 @@ export default function Workspace() {
                   >
                     <RefreshCw size={15} />
                   </button>
-                  <span className="rag-status">
-                    <FileText size={13} />
-                    文書参照なし
-                  </span>
+                  <label className="rag-status">
+                    <input type="checkbox" aria-label="文書検索を有効にする" checked={ragEnabled}
+                      disabled={busy || !selectedDocuments.length} onChange={(event) => setRagEnabled(event.target.checked)} />
+                    文書検索 {ragEnabled ? `${selectedDocuments.length}件` : "OFF"}
+                  </label>
+                  <button className="icon-button" title="検索対象の文書を選ぶ" aria-label="検索対象の文書を選ぶ" disabled={busy} onClick={() => setView("knowledge")}><FileText size={16} /></button>
                 </div>
                 {model === demo && (
                   <div className="demo-banner">
@@ -777,6 +808,12 @@ export default function Workspace() {
                                   "（出力なし）"
                                 ))}
                             </div>
+                            {item.role === "assistant" && item.rag && (
+                              <div className="message-sources">
+                                <small>生成時の参照箇所 {item.references?.length ?? 0} 件</small>
+                                <References sources={item.references ?? []} />
+                              </div>
+                            )}
                             {item.role === "assistant" && item.content && (
                               <button
                                 className="copy-message"

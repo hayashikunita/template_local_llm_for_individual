@@ -6,6 +6,25 @@ export type ChatMessage = {
   content: string;
   model: string;
   status: string;
+  references?: Reference[];
+  rag?: boolean;
+};
+export type KnowledgeDocument = {
+  id: string;
+  name: string;
+  sha256: string;
+  created_at: string;
+  size_bytes: number;
+  chunk_count: number;
+};
+export type Reference = {
+  citation: number;
+  document_id: string;
+  name: string;
+  sha256: string;
+  start_line: number;
+  end_line: number;
+  content: string;
 };
 export type Conversation = {
   id: string;
@@ -20,6 +39,8 @@ export type StreamEvent = {
   content?: string;
   status?: string;
   error?: string;
+  references?: Reference[];
+  rag?: boolean;
 };
 
 export async function request<T>(

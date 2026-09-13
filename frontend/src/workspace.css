@@ -115,6 +115,107 @@ pre,
   min-height: 520px;
   overflow: hidden;
 }
+.knowledge-view {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 32px;
+}
+.knowledge-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: center;
+  padding: 20px 0;
+  border-bottom: 1px solid var(--line);
+}
+.knowledge-actions > span,
+.document-name small,
+.message-sources > small {
+  font-size: 11px;
+  color: var(--muted);
+}
+.document-row {
+  display: grid;
+  grid-template-columns: 20px 20px minmax(0, 1fr) 34px 34px;
+  gap: 12px;
+  align-items: center;
+  padding: 18px 0;
+  border-bottom: 1px solid var(--line);
+}
+.document-name {
+  display: grid;
+  gap: 6px;
+  overflow-wrap: anywhere;
+}
+.document-row input,
+.rag-status input {
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  flex-shrink: 0;
+}
+.knowledge-empty {
+  padding: 32px 0;
+  color: var(--muted);
+}
+.knowledge-search {
+  display: grid;
+  gap: 18px;
+  padding: 24px 0;
+}
+.knowledge-search h2 {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+.knowledge-search form {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 36px;
+  gap: 10px;
+}
+.knowledge-search > button {
+  justify-self: start;
+}
+.references {
+  display: grid;
+  gap: 8px;
+  margin: 8px 0;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.references details {
+  border-left: 2px solid var(--line);
+  padding: 8px 12px;
+}
+.references summary {
+  cursor: pointer;
+}
+.reference-excerpt {
+  white-space: pre-wrap;
+  padding: 12px 0;
+  line-height: 1.8;
+}
+.source-hash {
+  display: block;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+.source-download {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 8px;
+  text-decoration: underline;
+}
+.message-sources {
+  margin-top: 14px;
+}
+@media (max-width: 700px) {
+  .knowledge-view { padding: 20px 16px; }
+  .document-row { gap: 7px; }
+  .model-bar { flex-wrap: wrap; }
+}
 .sidebar {
   width: 264px;
   flex-shrink: 0;
@@ -948,9 +1049,15 @@ dialog input {
   }
   .model-bar {
     padding: 0 22px 12px;
+    flex-wrap: wrap;
   }
   .rag-status {
-    display: none;
+    flex-basis: calc(100% - 42px);
+    margin-left: 0;
+    order: 1;
+  }
+  .rag-status + button {
+    order: 1;
   }
   .topbar {
     padding: 0 22px;
